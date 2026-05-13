@@ -174,10 +174,15 @@ if (!tags.split("\n").includes(`v${version}`)) {
     run(`git tag -a v${version} -m "claude-p v${version}"`);
   }
 } else {
-  console.log(`  v${version} already tagged`);
+  console.log(`  v${version} already tagged locally`);
 }
 
-if (DRY_RUN) {
+// Push tag if not already at remote (idempotent — surviveable when CI is
+// triggered by a tag push, where the tag is already there).
+const remoteTag = capture(`git ls-remote --tags origin v${version} || true`);
+if (remoteTag.trim()) {
+  console.log(`  v${version} already pushed to origin`);
+} else if (DRY_RUN) {
   console.log("  DRY RUN — would push tag with: git push origin v" + version);
 } else {
   run(`git push origin v${version}`);
