@@ -138,7 +138,16 @@ const SharedState = struct {
     pending_to_pty: std.ArrayList(u8) = .{},
     bytes_seen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    // Rolling buffer of recently-seen output. The driver loop scans this
+    // for the workspace-trust dialog (shown in unfamiliar directories,
+    // not bypassed by --dangerously-skip-permissions) and dismisses it
+    // by pressing Enter.
+    recent_mutex: std.Thread.Mutex = .{},
+    recent: std.ArrayList(u8) = .{},
+    trust_dismissed: bool = false,
 };
+
+const recent_capacity: usize = 8192;
 
 fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
     const shared: *SharedState = @ptrCast(@alignCast(ctx));
@@ -154,6 +163,20 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
                 shared.pending_to_pty.appendSlice(std.heap.page_allocator, resp.items) catch {};
                 shared.write_mutex.unlock();
             }
+            // Update the rolling recent-output buffer for trust-dialog
+            // detection in the main loop.
+            shared.recent_mutex.lock();
+            shared.recent.appendSlice(std.heap.page_allocator, po.data) catch {};
+            if (shared.recent.items.len > recent_capacity) {
+                const drop = shared.recent.items.len - recent_capacity;
+                std.mem.copyForwards(
+                    u8,
+                    shared.recent.items[0 .. recent_capacity],
+                    shared.recent.items[drop..],
+                );
+                shared.recent.shrinkRetainingCapacity(recent_capacity);
+            }
+            shared.recent_mutex.unlock();
             if (shared.debug) std.debug.print("zmux pane_output: {d} bytes\n", .{po.data.len});
         },
         .session_exited => |se| {
@@ -222,6 +245,9 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         shared.write_mutex.lock();
         shared.pending_to_pty.deinit(std.heap.page_allocator);
         shared.write_mutex.unlock();
+        shared.recent_mutex.lock();
+        shared.recent.deinit(std.heap.page_allocator);
+        shared.recent_mutex.unlock();
     }
 
     const sink: zmux.native.EventSink = .{
@@ -278,6 +304,29 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             allocator.free(bytes);
         }
 
+        // Workspace-trust dialog detection. Claude shows a "Is this a project
+        // you trust?" prompt in unfamiliar directories that blocks startup
+        // *before* SessionStart hooks register and is not bypassed by
+        // --dangerously-skip-permissions. Default selection is "Yes, I trust
+        // this folder"; Enter accepts.
+        if (!shared.trust_dismissed and state == .waiting_for_ready) {
+            shared.recent_mutex.lock();
+            const stripped = try stripCsi(allocator, shared.recent.items);
+            shared.recent_mutex.unlock();
+            defer allocator.free(stripped);
+            // After stripping CSI, words are concatenated (because the dialog
+            // pads with `\033[1C` cursor-move, not real spaces). Search for
+            // two distinct single-word markers both being present in the
+            // pre-SessionStart output stream.
+            const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
+            const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
+            if (has_trust and has_folder) {
+                if (opts.debug) std.debug.print("trust dialog detected — sending Enter\n", .{});
+                session.send("", true) catch {};
+                shared.trust_dismissed = true;
+            }
+        }
+
         // Drain the FIFO.
         const fifo_n = std.posix.read(fifo_fd, &fifo_read_buf) catch |e| switch (e) {
             error.WouldBlock => 0,
@@ -293,7 +342,21 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     switch (ev.event) {
                         .session_start => {
                             if (state == .waiting_for_ready) {
-                                session.send(opts.prompt, true) catch {};
+                                // Give Ink time to finish initialising and
+                                // start accepting keystrokes.
+                                std.Thread.sleep(1500 * std.time.ns_per_ms);
+                                if (opts.debug) std.debug.print("typing prompt ({d} bytes)\n", .{opts.prompt.len});
+
+                                // Send prompt body, sleep, then Enter as a
+                                // separate event. Ink applies bracketed-paste
+                                // / burst-input heuristics: if `\r` arrives
+                                // in the same burst as the prompt, it lands
+                                // in the input buffer instead of triggering
+                                // submit. The gap makes Ink see two events.
+                                session.send(opts.prompt, false) catch {};
+                                std.Thread.sleep(120 * std.time.ns_per_ms);
+                                session.send("", true) catch {};
+
                                 state = .awaiting_stop;
                             }
                         },
@@ -322,12 +385,19 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     // fall back to `last_assistant_message` from the Stop payload.
     var summary = blk: {
         var attempt: u32 = 0;
-        while (attempt < 20) : (attempt += 1) {
-            const s = transcript_mod.parseFile(allocator, tp) catch |e| switch (e) {
+        while (attempt < 40) : (attempt += 1) {
+            var maybe = transcript_mod.parseFile(allocator, tp) catch |e| switch (e) {
                 error.NoAssistantMessage, error.FileNotFound => null,
                 else => return e,
             };
-            if (s) |valid| break :blk valid;
+            if (maybe) |valid| {
+                // If the assistant text is empty but no error was reported,
+                // we likely read the transcript before the final text-block
+                // assistant message was flushed (the early lines only have
+                // thinking + tool_use blocks). Retry until text appears.
+                if (valid.final_text.len > 0 or valid.is_error) break :blk valid;
+                maybe.?.deinit(allocator);
+            }
             std.Thread.sleep(50 * std.time.ns_per_ms);
         }
         if (stop_payload_owned) |payload| {
@@ -358,6 +428,60 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         .summary = summary,
         .duration_ms = @intCast(@divTrunc(total_ns, std.time.ns_per_ms)),
     };
+}
+
+/// Strip CSI / OSC / DCS escape sequences, leaving only literal payload.
+/// Used to make plain-text substring matching (e.g. trust-dialog detection)
+/// robust against cursor-positioning escapes that pad words with `\033[1C`.
+fn stripCsi(allocator: std.mem.Allocator, bytes: []const u8) ![]u8 {
+    var out: std.ArrayList(u8) = .{};
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < bytes.len) {
+        const b = bytes[i];
+        if (b != 0x1b) {
+            try out.append(allocator, b);
+            i += 1;
+            continue;
+        }
+        if (i + 1 >= bytes.len) break;
+        const next = bytes[i + 1];
+        switch (next) {
+            '[' => {
+                i += 2;
+                while (i < bytes.len and bytes[i] >= 0x30 and bytes[i] <= 0x3f) : (i += 1) {}
+                while (i < bytes.len and bytes[i] >= 0x20 and bytes[i] <= 0x2f) : (i += 1) {}
+                if (i < bytes.len) i += 1; // final byte
+            },
+            ']' => {
+                i += 2;
+                while (i < bytes.len) : (i += 1) {
+                    if (bytes[i] == 0x07) {
+                        i += 1;
+                        break;
+                    }
+                    if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                }
+            },
+            'P', 'X', '^', '_' => {
+                i += 2;
+                while (i < bytes.len) : (i += 1) {
+                    if (bytes[i] == 0x1b and i + 1 < bytes.len and bytes[i + 1] == '\\') {
+                        i += 2;
+                        break;
+                    }
+                }
+            },
+            else => {
+                i += 2;
+            },
+        }
+    }
+    return try out.toOwnedSlice(allocator);
 }
 
 // -------- tests --------
