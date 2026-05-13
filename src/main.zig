@@ -1,27 +1,105 @@
+//! `claude-p` CLI entry point. Parses argv, runs the driver, emits output.
 const std = @import("std");
 const claude_p = @import("claude_p");
 
 pub fn main() !void {
-    // Prints to stderr, ignoring potential errors.
-    std.debug.print("All your {s} are belong to us.\n", .{"codebase"});
-    try claude_p.bufferedPrint();
-}
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .{};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
 
-test "simple test" {
-    const gpa = std.testing.allocator;
-    var list: std.ArrayList(i32) = .empty;
-    defer list.deinit(gpa); // Try commenting this out and see if zig detects the memory leak!
-    try list.append(gpa, 42);
-    try std.testing.expectEqual(@as(i32, 42), list.pop());
-}
+    const argv_raw = try std.process.argsAlloc(allocator);
+    defer std.process.argsFree(allocator, argv_raw);
+    const argv = argv_raw[1..];
 
-test "fuzz example" {
-    const Context = struct {
-        fn testOne(context: @This(), input: []const u8) anyerror!void {
-            _ = context;
-            // Try passing `--fuzz` to `zig build test` and see if it manages to fail this test case!
-            try std.testing.expect(!std.mem.eql(u8, "canyoufindme", input));
-        }
+    var opts = claude_p.args.parse(allocator, argv) catch |err| {
+        try printError(err);
+        std.process.exit(2);
     };
-    try std.testing.fuzz(Context{}, Context.testOne, .{});
+    defer opts.deinit(allocator);
+
+    if (opts.show_help) {
+        try stdoutWriter().writeAll(claude_p.args.helpText());
+        try stdoutWriter().flush();
+        return;
+    }
+    if (opts.show_version) {
+        try stdoutWriter().print("claude-p {f}\n", .{claude_p.version});
+        try stdoutWriter().flush();
+        return;
+    }
+
+    // Resolve prompt: positional, file, or stdin.
+    var prompt_buf: ?[]u8 = null;
+    defer if (prompt_buf) |p| allocator.free(p);
+
+    const prompt: []const u8 = blk: {
+        if (opts.prompt) |p| break :blk p;
+        if (opts.input_file) |path| {
+            const f = try std.fs.cwd().openFile(path, .{});
+            defer f.close();
+            prompt_buf = try f.readToEndAlloc(allocator, 16 * 1024 * 1024);
+            break :blk std.mem.trimRight(u8, prompt_buf.?, "\r\n");
+        }
+        // Read from stdin.
+        var stdin_file = std.fs.File.stdin();
+        prompt_buf = try stdin_file.readToEndAlloc(allocator, 16 * 1024 * 1024);
+        break :blk std.mem.trimRight(u8, prompt_buf.?, "\r\n");
+    };
+
+    if (prompt.len == 0) {
+        try stderrWriter().writeAll("error: empty prompt (positional, --input-file, or stdin required)\n");
+        try stderrWriter().flush();
+        std.process.exit(2);
+    }
+
+    var result = claude_p.run(allocator, .{
+        .prompt = prompt,
+        .output_format = opts.output_format,
+        .model = opts.model,
+        .max_turns = opts.max_turns,
+        .allowed_tools = opts.allowed_tools,
+        .skip_permissions = opts.dangerously_skip_permissions,
+        .resume_session = opts.resume_session,
+        .cont = opts.cont,
+        .session_id = opts.session_id,
+        .cwd = opts.cwd,
+        .extra_args = opts.passthrough.items,
+        .verbose = opts.verbose,
+        .timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
+        .debug = opts.debug,
+    }) catch |err| {
+        try stderrWriter().print("claude-p: {s}\n", .{@errorName(err)});
+        try stderrWriter().flush();
+        std.process.exit(2);
+    };
+    defer result.deinit(allocator);
+
+    var stdout = stdoutWriter();
+    try result.write(allocator, stdout, opts.output_format);
+    try stdout.flush();
+
+    std.process.exit(result.exitCode());
+}
+
+fn printError(err: anyerror) !void {
+    var w = stderrWriter();
+    try w.print("claude-p: bad arguments: {s}\n", .{@errorName(err)});
+    try w.flush();
+}
+
+// std.fs.File.stdout() / .stderr() return a File; we need a Writer to use the
+// std.Io.Writer interface.
+var stdout_buf: [4096]u8 = undefined;
+var stderr_buf: [4096]u8 = undefined;
+var stdout_writer: ?std.fs.File.Writer = null;
+var stderr_writer: ?std.fs.File.Writer = null;
+
+fn stdoutWriter() *std.Io.Writer {
+    if (stdout_writer == null) stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    return &stdout_writer.?.interface;
+}
+
+fn stderrWriter() *std.Io.Writer {
+    if (stderr_writer == null) stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    return &stderr_writer.?.interface;
 }

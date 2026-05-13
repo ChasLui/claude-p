@@ -1,23 +1,30 @@
-//! By convention, root.zig is the root source file when making a library.
+//! Public Zig library API for `claude-p`.
+//!
+//! Re-read SPEC.md for the architectural overview. The high-level API is
+//! `run(allocator, opts)` which spawns `claude` under a libghostty-managed
+//! PTY, feeds it the prompt, waits for the Stop hook, and returns a Result
+//! containing the assistant's final message plus telemetry.
 const std = @import("std");
 
-pub fn bufferedPrint() !void {
-    // Stdout is for the actual output of your application, for example if you
-    // are implementing gzip, then only the compressed bytes should be sent to
-    // stdout, not any debugging messages.
-    var stdout_buffer: [1024]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buffer);
-    const stdout = &stdout_writer.interface;
+pub const args = @import("args.zig");
+pub const transcript = @import("transcript.zig");
+pub const emit = @import("emit.zig");
+pub const hook = @import("hook.zig");
+pub const terminal = @import("terminal.zig");
+pub const driver = @import("driver.zig");
 
-    try stdout.print("Run `zig build test` to run the tests.\n", .{});
+pub const Options = driver.Options;
+pub const Result = driver.Result;
+pub const Usage = transcript.Usage;
+pub const OutputFormat = args.OutputFormat;
 
-    try stdout.flush(); // Don't forget to flush!
+pub const version: std.SemanticVersion = .{ .major = 0, .minor = 0, .patch = 1 };
+
+pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
+    return driver.run(allocator, opts);
 }
 
-pub fn add(a: i32, b: i32) i32 {
-    return a + b;
-}
-
-test "basic add functionality" {
-    try std.testing.expect(add(3, 7) == 10);
+test {
+    // Pull in tests from every submodule.
+    std.testing.refAllDecls(@This());
 }
