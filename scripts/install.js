@@ -85,7 +85,7 @@ function get(url) {
 }
 
 async function download() {
-  const url = `https://github.com/williamcory/claude-p/releases/download/v${pkg.version}/claude-p-${platformDir()}.gz`;
+  const url = `https://github.com/smithersai/claude-p/releases/download/v${pkg.version}/claude-p-${platformDir()}.gz`;
   log(`downloading ${url}`);
   const gz = await get(url);
   const bin = zlib.gunzipSync(gz);

@@ -15,11 +15,11 @@
   "author": "William Cory <will@tevm.tech>",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/williamcory/claude-p.git"
+    "url": "git+https://github.com/smithersai/claude-p.git"
   },
-  "homepage": "https://github.com/williamcory/claude-p#readme",
+  "homepage": "https://github.com/smithersai/claude-p#readme",
   "bugs": {
-    "url": "https://github.com/williamcory/claude-p/issues"
+    "url": "https://github.com/smithersai/claude-p/issues"
   },
   "bin": {
     "claude-p": "bin/claude-p.js"
