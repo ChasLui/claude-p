@@ -1,0 +1,47 @@
+{
+  "name": "claude-p",
+  "version": "0.0.1",
+  "description": "Drop-in replacement for `claude -p` that drives the interactive `claude` UI inside an in-process zmux PTY session.",
+  "keywords": [
+    "claude",
+    "claude-code",
+    "anthropic",
+    "cli",
+    "zig",
+    "pty",
+    "zmux"
+  ],
+  "license": "MIT",
+  "author": "William Cory <will@tevm.tech>",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/williamcory/claude-p.git"
+  },
+  "homepage": "https://github.com/williamcory/claude-p#readme",
+  "bugs": {
+    "url": "https://github.com/williamcory/claude-p/issues"
+  },
+  "bin": {
+    "claude-p": "bin/claude-p.js"
+  },
+  "files": [
+    "bin/claude-p.js",
+    "scripts/install.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/install.js"
+  },
+  "os": [
+    "darwin",
+    "linux"
+  ],
+  "cpu": [
+    "x64",
+    "arm64"
+  ],
+  "engines": {
+    "node": ">=18"
+  }
+}
