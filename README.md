@@ -9,6 +9,8 @@ A drop-in replacement for `claude -p` that drives the interactive
 
 [zmux]: https://github.com/smithersai/zmux
 
+Built using [smithers](https://github.com/smithersai/smithers) self-improving harness
+
 ## Use
 
 ```bash
