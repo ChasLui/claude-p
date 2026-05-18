@@ -52,6 +52,13 @@ pub fn main() !void {
         std.process.exit(2);
     }
 
+    // For stream-json output, hand stdout to the driver so transcript lines
+    // can be written live as `claude` flushes them. Other formats accumulate
+    // and emit once at the end.
+    const stdout = stdoutWriter();
+    const stream_writer: ?*std.Io.Writer =
+        if (opts.output_format == .stream_json) stdout else null;
+
     var result = claude_p.run(allocator, .{
         .prompt = prompt,
         .output_format = opts.output_format,
@@ -67,6 +74,7 @@ pub fn main() !void {
         .verbose = opts.verbose,
         .timeout_ms = @as(u64, opts.timeout_seconds) * 1000,
         .debug = opts.debug,
+        .stream_writer = stream_writer,
     }) catch |err| {
         try stderrWriter().print("claude-p: {s}\n", .{@errorName(err)});
         try stderrWriter().flush();
@@ -74,7 +82,7 @@ pub fn main() !void {
     };
     defer result.deinit(allocator);
 
-    var stdout = stdoutWriter();
+    // Result.write is a no-op when stream-json was already streamed.
     try result.write(allocator, stdout, opts.output_format);
     try stdout.flush();
 

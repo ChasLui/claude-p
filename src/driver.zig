@@ -8,6 +8,7 @@ const transcript_mod = @import("transcript.zig");
 const emit_mod = @import("emit.zig");
 const hook_mod = @import("hook.zig");
 const terminal_mod = @import("terminal.zig");
+const stream_mod = @import("stream.zig");
 
 pub const Options = struct {
     prompt: []const u8,
@@ -28,11 +29,21 @@ pub const Options = struct {
     cols: u16 = 120,
     rows: u16 = 40,
     debug: bool = false,
+    /// When set and `output_format` is `.stream_json`, the driver tails the
+    /// session transcript and writes each JSONL line to this writer as it
+    /// is flushed by the child `claude`. After Stop, the driver writes the
+    /// final `result` envelope and flushes. Result.streamed is set to true
+    /// so callers can avoid re-emitting via Result.write.
+    stream_writer: ?*std.Io.Writer = null,
 };
 
 pub const Result = struct {
     summary: transcript_mod.Summary,
     duration_ms: u64,
+    /// True if `run()` already streamed stream-json output to the caller's
+    /// `stream_writer`. `Result.write` is a no-op for `.stream_json` in that
+    /// case to avoid double-emit.
+    streamed: bool = false,
 
     pub fn deinit(self: *Result, allocator: std.mem.Allocator) void {
         self.summary.deinit(allocator);
@@ -44,6 +55,7 @@ pub const Result = struct {
         writer: *std.Io.Writer,
         fmt: args_mod.OutputFormat,
     ) !void {
+        if (self.streamed and fmt == .stream_json) return;
         try emit_mod.emit(allocator, writer, fmt, .{
             .summary = &self.summary,
             .duration_ms = self.duration_ms,
@@ -128,6 +140,68 @@ fn shellQuoteOne(allocator: std.mem.Allocator, out: *std.ArrayList(u8), s: []con
     try out.append(allocator, '\'');
 }
 
+/// How long the PTY output stream must be quiet before we believe Ink has
+/// finished its initial render and is ready to accept keystrokes. Smaller
+/// values type sooner; too small risks racing Ink's prompt-box draw. Tuned
+/// to 80 ms based on observed bursts (the input box renders in <50 ms of
+/// continuous output, then goes silent).
+const ink_quiescence_ms: u64 = 80;
+
+/// Upper bound on how long we'll wait for quiescence. If Ink keeps emitting
+/// output past this, we give up and type anyway; in practice the prompt box
+/// is always up by then, and the failure mode is identical to the previous
+/// fixed-sleep behavior.
+const ink_max_wait_ms: u64 = 2000;
+
+/// How long to wait between sending the prompt bytes and sending Enter.
+/// Ink's bracketed-paste heuristic merges back-to-back writes; without a
+/// gap, `\r` lands in the input buffer instead of triggering submit.
+const ink_enter_debounce_ms: u64 = 120;
+
+/// Block until the child PTY has been quiet for at least `ink_quiescence_ms`,
+/// up to a cap of `ink_max_wait_ms`. Replaces the hardcoded "give Ink time
+/// to settle" sleep from the original fix — adapts to whatever boot latency
+/// the machine actually has.
+fn waitForInkQuiescent(opts: Options, trace_start: i128, shared: *SharedState) void {
+    const quiescence_ns: i128 = @intCast(ink_quiescence_ms * std.time.ns_per_ms);
+    const max_ns: i128 = @intCast(ink_max_wait_ms * std.time.ns_per_ms);
+    const wait_started: i128 = std.time.nanoTimestamp();
+    while (true) {
+        const now: i128 = std.time.nanoTimestamp();
+        if (now - wait_started > max_ns) {
+            traceFmt(opts, trace_start, "Ink readiness wait hit max ({d}ms) — typing anyway", .{ink_max_wait_ms});
+            return;
+        }
+        const last: i128 = shared.last_output_ns.load(.seq_cst);
+        if (last != 0 and now - last > quiescence_ns) {
+            const since_ms: i64 = @intCast(@divTrunc(now - last, std.time.ns_per_ms));
+            const waited_ms: i64 = @intCast(@divTrunc(now - wait_started, std.time.ns_per_ms));
+            traceFmt(opts, trace_start, "Ink quiescent (output silent for {d}ms, waited {d}ms total)", .{ since_ms, waited_ms });
+            return;
+        }
+        std.Thread.sleep(15 * std.time.ns_per_ms);
+    }
+}
+
+/// Emit a debug-gated trace line to stderr with the elapsed time since
+/// `start`. Lets the user pinpoint where the latency in a `--debug` run is
+/// going: hook harness setup, claude/Ink boot, first transcript flush, etc.
+fn trace(opts: Options, start: i128, label: []const u8) void {
+    if (!opts.debug) return;
+    const now: i128 = std.time.nanoTimestamp();
+    const elapsed_ms: i64 = @intCast(@divTrunc(now - start, std.time.ns_per_ms));
+    std.debug.print("[claude-p +{d}ms] {s}\n", .{ elapsed_ms, label });
+}
+
+fn traceFmt(opts: Options, start: i128, comptime fmt: []const u8, args: anytype) void {
+    if (!opts.debug) return;
+    const now: i128 = std.time.nanoTimestamp();
+    const elapsed_ms: i64 = @intCast(@divTrunc(now - start, std.time.ns_per_ms));
+    std.debug.print("[claude-p +{d}ms] ", .{elapsed_ms});
+    std.debug.print(fmt, args);
+    std.debug.print("\n", .{});
+}
+
 // Thread-shared state between the NativeSession reader thread and the
 // driver's main loop.
 const SharedState = struct {
@@ -137,6 +211,11 @@ const SharedState = struct {
     write_mutex: std.Thread.Mutex = .{},
     pending_to_pty: std.ArrayList(u8) = .{},
     bytes_seen: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    /// Timestamp (ns since arbitrary epoch — std.time.nanoTimestamp) of the
+    /// most recent pane_output event. Used by the main loop to decide when
+    /// Ink has gone quiescent (UI rendering done) and is therefore ready to
+    /// accept keystrokes — replaces a previous hardcoded 1500 ms sleep.
+    last_output_ns: std.atomic.Value(i128) = std.atomic.Value(i128).init(0),
     exited: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     // Rolling buffer of recently-seen output. The driver loop scans this
     // for the workspace-trust dialog (shown in unfamiliar directories,
@@ -154,6 +233,7 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
     switch (event) {
         .pane_output => |po| {
             _ = shared.bytes_seen.fetchAdd(po.data.len, .seq_cst);
+            shared.last_output_ns.store(std.time.nanoTimestamp(), .seq_cst);
             // Run the DEC-query responder; queue responses for the main loop.
             var resp: std.ArrayList(u8) = .{};
             defer resp.deinit(std.heap.page_allocator);
@@ -190,8 +270,12 @@ fn onZmuxEvent(ctx: *anyopaque, event: zmux.native.Event) void {
 pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     if (opts.prompt.len == 0) return RunError.NoPromptSupplied;
 
+    const trace_start: i128 = std.time.nanoTimestamp();
+    trace(opts, trace_start, "run() entered");
+
     var harness = try hook_mod.create(allocator);
     defer harness.deinit();
+    trace(opts, trace_start, "hook harness ready (FIFO + relay script + --settings)");
 
     const claude_bin = opts.claude_path orelse "claude";
 
@@ -267,9 +351,12 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     }) catch return RunError.SpawnFailed;
     shared.session = session;
     defer session.destroy();
+    trace(opts, trace_start, "zmux session spawned; child claude PID up, Ink booting");
 
-    const start_ns: i128 = std.time.nanoTimestamp();
+    const start_ns: i128 = trace_start;
     var state: enum { waiting_for_ready, awaiting_stop } = .waiting_for_ready;
+    var first_emit_logged = false;
+    var total_lines_streamed: usize = 0;
 
     var fifo_buf: std.ArrayList(u8) = .{};
     defer fifo_buf.deinit(allocator);
@@ -279,6 +366,21 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     defer if (transcript_path) |p| allocator.free(p);
     var stop_payload_owned: ?[]u8 = null;
     defer if (stop_payload_owned) |p| allocator.free(p);
+
+    // Live transcript tailer. Opened lazily once we learn `transcript_path`
+    // (typically from the SessionStart hook payload). Only used when the
+    // caller requested stream-json output AND supplied a writer.
+    //
+    // The transcript_path arrives in the SessionStart payload but the file
+    // itself may not exist on disk until claude flushes its first line —
+    // so opening can fail at SessionStart and needs to be retried in the
+    // main loop until it succeeds. Without this retry the streaming path
+    // degenerates to a single post-Stop dump, which is the "12s of silence
+    // then everything at once" symptom users see.
+    const streaming = opts.output_format == .stream_json and opts.stream_writer != null;
+    var tailer: ?stream_mod.Tailer = null;
+    defer if (tailer) |*t| t.deinit();
+    var tailer_open_attempts: u32 = 0;
 
     while (true) {
         const now: i128 = std.time.nanoTimestamp();
@@ -321,7 +423,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
             const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
             if (has_trust and has_folder) {
-                if (opts.debug) std.debug.print("trust dialog detected — sending Enter\n", .{});
+                trace(opts, trace_start, "workspace-trust dialog detected — sending Enter to dismiss");
                 session.send("", true) catch {};
                 shared.trust_dismissed = true;
             }
@@ -341,11 +443,27 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     if (opts.debug) std.debug.print("hook: {s} payload={s}\n", .{ @tagName(ev.event), ev.payload });
                     switch (ev.event) {
                         .session_start => {
+                            trace(opts, trace_start, "SessionStart hook fired (Ink is up)");
+                            // SessionStart payloads carry the transcript
+                            // path. Stash it so the main loop can keep
+                            // trying to open the tailer until the file
+                            // actually exists on disk.
+                            if (streaming and transcript_path == null) {
+                                if (try hook_mod.extractTranscriptPath(allocator, ev.payload)) |p| {
+                                    transcript_path = p;
+                                    traceFmt(opts, trace_start, "transcript_path from SessionStart: {s}", .{p});
+                                }
+                            }
                             if (state == .waiting_for_ready) {
-                                // Give Ink time to finish initialising and
-                                // start accepting keystrokes.
-                                std.Thread.sleep(1500 * std.time.ns_per_ms);
-                                if (opts.debug) std.debug.print("typing prompt ({d} bytes)\n", .{opts.prompt.len});
+                                // Wait for Ink to finish its initial render
+                                // before sending keystrokes. Signal: the PTY
+                                // output stream has been quiet for the
+                                // quiescence threshold below. Adaptive —
+                                // fast machines proceed in <100 ms, slow
+                                // ones get up to ink_max_wait_ms before we
+                                // give up and type anyway.
+                                waitForInkQuiescent(opts, trace_start, &shared);
+                                traceFmt(opts, trace_start, "typing prompt ({d} bytes)", .{opts.prompt.len});
 
                                 // Send prompt body, sleep, then Enter as a
                                 // separate event. Ink applies bracketed-paste
@@ -354,14 +472,18 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                                 // in the input buffer instead of triggering
                                 // submit. The gap makes Ink see two events.
                                 session.send(opts.prompt, false) catch {};
-                                std.Thread.sleep(120 * std.time.ns_per_ms);
+                                std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                                 session.send("", true) catch {};
+                                trace(opts, trace_start, "prompt + Enter sent; waiting on claude API");
 
                                 state = .awaiting_stop;
                             }
                         },
                         .stop => {
-                            transcript_path = try hook_mod.extractTranscriptPath(allocator, ev.payload);
+                            trace(opts, trace_start, "Stop hook fired (assistant turn finished)");
+                            if (transcript_path == null) {
+                                transcript_path = try hook_mod.extractTranscriptPath(allocator, ev.payload);
+                            }
                             stop_payload_owned = try allocator.dupe(u8, ev.payload);
                         },
                         .unknown => {},
@@ -369,13 +491,76 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                 }
                 std.mem.copyForwards(u8, fifo_buf.items, fifo_buf.items[nl + 1 ..]);
                 fifo_buf.shrinkRetainingCapacity(fifo_buf.items.len - (nl + 1));
-                if (transcript_path != null) break;
+                if (stop_payload_owned != null) break;
             }
         }
 
-        if (transcript_path != null) break;
+        // Open the tailer as soon as the transcript file shows up on disk.
+        // claude writes `transcript_path` into the SessionStart payload
+        // before it has actually created the file; we keep retrying so we
+        // can start emitting from the very first line `claude` writes.
+        if (streaming and tailer == null) {
+            if (transcript_path) |p| {
+                tailer_open_attempts += 1;
+                if (stream_mod.Tailer.open(allocator, p)) |t| {
+                    tailer = t;
+                    traceFmt(opts, trace_start, "transcript opened for tailing after {d} attempt(s): {s}", .{ tailer_open_attempts, p });
+                } else |e| switch (e) {
+                    error.FileNotFound => {
+                        // Expected; keep trying.
+                        if (tailer_open_attempts == 1) {
+                            traceFmt(opts, trace_start, "transcript not yet on disk; retrying (path={s})", .{p});
+                        }
+                    },
+                    else => {
+                        traceFmt(opts, trace_start, "transcript open failed: {s}", .{@errorName(e)});
+                    },
+                }
+            }
+        }
+
+        // Pump any new transcript bytes to the caller's stream_writer.
+        if (streaming and tailer != null and opts.stream_writer != null) {
+            const n = tailer.?.pump(opts.stream_writer.?) catch 0;
+            if (n > 0) {
+                opts.stream_writer.?.flush() catch {};
+                total_lines_streamed += n;
+                if (!first_emit_logged) {
+                    traceFmt(opts, trace_start, "first transcript line streamed ({d} line(s) in first flush)", .{n});
+                    first_emit_logged = true;
+                } else {
+                    traceFmt(opts, trace_start, "streamed {d} more line(s) (total={d})", .{ n, total_lines_streamed });
+                }
+            }
+        }
+
+        if (stop_payload_owned != null) break;
 
         std.Thread.sleep(5 * std.time.ns_per_ms);
+    }
+
+    // Final pump — Claude flushes the last assistant message after Stop fires.
+    if (streaming and opts.stream_writer != null) {
+        trace(opts, trace_start, "draining post-Stop transcript flush window (20 × 20ms)");
+        // The Stop event may have arrived before claude flushed the trailing
+        // transcript line. If we haven't opened a Tailer yet (transcript_path
+        // only arrived via Stop), do it now.
+        if (tailer == null) {
+            if (transcript_path) |p| tailer = stream_mod.Tailer.open(allocator, p) catch null;
+        }
+        if (tailer != null) {
+            // Retry briefly to catch the final-flush window (same race the
+            // parseFile fallback below handles).
+            var attempt: u32 = 0;
+            var post_stop_lines: usize = 0;
+            while (attempt < 20) : (attempt += 1) {
+                const n = tailer.?.pump(opts.stream_writer.?) catch 0;
+                post_stop_lines += n;
+                std.Thread.sleep(20 * std.time.ns_per_ms);
+            }
+            opts.stream_writer.?.flush() catch {};
+            traceFmt(opts, trace_start, "post-Stop drain streamed {d} more line(s)", .{post_stop_lines});
+        }
     }
 
     const tp = transcript_path orelse return RunError.TranscriptUnavailable;
@@ -424,9 +609,29 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
     session.terminate();
 
     const total_ns: i128 = std.time.nanoTimestamp() - start_ns;
+    const duration_ms: u64 = @intCast(@divTrunc(total_ns, std.time.ns_per_ms));
+
+    // If we streamed transcript JSONL live, append the trailing `result`
+    // envelope (the same final line `claude -p --output-format stream-json`
+    // emits) so the wire format is complete.
+    var streamed = false;
+    if (streaming) {
+        if (opts.stream_writer) |w| {
+            try emit_mod.emitJson(allocator, w, .{
+                .summary = &summary,
+                .duration_ms = duration_ms,
+            });
+            w.flush() catch {};
+            streamed = true;
+            trace(opts, trace_start, "result envelope emitted; stream done");
+        }
+    }
+
+    traceFmt(opts, trace_start, "run() returning (total_lines_streamed={d}, duration={d}ms)", .{ total_lines_streamed, duration_ms });
     return Result{
         .summary = summary,
-        .duration_ms = @intCast(@divTrunc(total_ns, std.time.ns_per_ms)),
+        .duration_ms = duration_ms,
+        .streamed = streamed,
     };
 }
 

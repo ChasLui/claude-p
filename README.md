@@ -72,9 +72,13 @@ Unrecognized flags are forwarded verbatim to `claude`.
 
 - **macOS / Linux only.** No Windows (no `forkpty`).
 - **Requires `claude` on `$PATH`.** The wrapper invokes the real CLI.
-- **Not true streaming.** Tokens are not streamed live — `claude-p`
-  waits for the model's turn to finish and then prints. For real-time
-  streaming, use `claude -p --output-format stream-json` directly.
+- **Per-message streaming, not per-token.** With
+  `--output-format stream-json`, transcript lines (user messages, tool
+  uses, assistant turns, the trailing `result` envelope) are emitted
+  to stdout the moment `claude` flushes them. Individual tokens within
+  a single assistant message are not streamed — those require
+  `claude -p --include-partial-messages` which is only available in
+  claude's native `--print` mode.
 - **Adds ~50–200 ms** over `claude -p` due to PTY + Ink startup
   overhead.
 - **Multiline prompts** must come via `--input-file` or stdin to keep

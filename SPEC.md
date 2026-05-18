@@ -76,6 +76,7 @@ solves (3).
 | `driver.zig`   | zmux session lifecycle; FIFO poll loop; argv build; tear-down.         |
 | `transcript.zig`| Parses the session JSONL written by Claude; extracts last assistant message and usage. |
 | `emit.zig`     | text / json / stream-json formatters; matches `claude -p` byte-for-byte. |
+| `stream.zig`   | Transcript tailer: streams JSONL lines from the live transcript file to a writer as `claude` flushes them. |
 | `root.zig`     | Public Zig library API.                                                |
 
 ### 2.2 zmux integration
@@ -151,7 +152,7 @@ duration_api_ms, num_turns.
 | ----------------- | ----------------------------------------------------------------------------------------------------------------------------- |
 | `text` (default)  | Last assistant message text + `\n`.                                                                                           |
 | `json`            | Single result object: `{type:"result", subtype, session_id, result, is_error, duration_ms, duration_api_ms, num_turns, total_cost_usd, usage, permission_denials}` |
-| `stream-json`     | JSONL replay of the transcript's events in order, terminated by the `result` object.                                          |
+| `stream-json`     | Live JSONL: transcript lines are emitted to stdout as `claude` flushes them (driver tails the transcript file). Terminated by the `result` object. |
 
 `session_id` is read from the transcript JSONL (`sessionId` in real Claude
 transcripts; `session_id` accepted too).
@@ -261,7 +262,11 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result;
 ## 8. Non-goals (v1)
 
 - Windows support (no `forkpty`; zmux doesn't support Windows either).
-- Real-time streaming of partial tokens — we wait for `Stop` and replay.
+- Per-token streaming within a single assistant message — that requires
+  `claude --print --include-partial-messages`, which isn't reachable
+  through the interactive PTY path. `--output-format stream-json` does
+  stream per-message: as soon as `claude` flushes a transcript line, the
+  driver tails it via `src/stream.zig` and writes it to stdout.
 - Tool-approval prompting — use `--dangerously-skip-permissions` or
   `--allowedTools`.
 
