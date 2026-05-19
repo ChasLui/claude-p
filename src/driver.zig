@@ -469,14 +469,21 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
         // separates them with `\033[1C` cursor-move rather than spaces,
         // so we look for multi-distinct-word markers.
         //
-        // Mutual exclusion is intentional (else-if, not two separate ifs):
-        // the rolling 8 KB `recent` buffer keeps BOTH dialogs' text once
-        // claude transitions from trust → bypass. Without `else if`, the
-        // same iteration that first fires the trust dismiss would also
-        // fire the bypass accept — sending `2`+Enter into a screen that
-        // is still mid-transition. Ink drops the key, claude stays on the
-        // bypass dialog (default "No, exit"), and the SessionStart hook
-        // never fires.
+        // The two detections are independent (both run per iteration) but
+        // guarded by a per-iteration `fired` flag so at most ONE keystroke
+        // is sent in a single loop pass. The rolling 8 KB `recent` buffer
+        // keeps BOTH dialogs' text once claude transitions from trust →
+        // bypass; without the `fired` guard, the same iteration that first
+        // fires the trust dismiss could also fire the bypass accept, sending
+        // `2`+Enter into a screen that is still mid-transition. Ink drops
+        // those keys, claude stays on the dialog, and SessionStart never
+        // fires.
+        //
+        // Independent (not else-if) because the dialogs are independent:
+        // a directory whose trust state is already persisted will skip the
+        // trust dialog entirely and go straight to bypass — `else if`
+        // would deadlock that case because `trust_dismissed` stays false
+        // forever, blocking bypass detection from ever running.
         //
         // Each detection also requires PTY quiescence (≥ dialog_quiescence_ms
         // since the last output byte) before sending a keystroke, so we
@@ -491,17 +498,19 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
             const now_ns: i64 = @intCast(std.time.nanoTimestamp());
             const quiescence_ns: i64 = @intCast(dialog_quiescence_ms * std.time.ns_per_ms);
             const quiescent = last_out != 0 and (now_ns - last_out) > quiescence_ns;
+            var fired_this_iter = false;
 
             // 1. Workspace-trust dialog: "Is this a project you trust?
             //    1. Yes, I trust this folder / 2. No, exit"
             //    Default selection = option 1 (Yes). Enter accepts.
-            if (!shared.trust_dismissed) {
+            if (!shared.trust_dismissed and !fired_this_iter) {
                 const has_trust = std.mem.indexOf(u8, stripped, "trust") != null;
                 const has_folder = std.mem.indexOf(u8, stripped, "folder") != null;
                 if (has_trust and has_folder and quiescent) {
                     trace(opts, trace_start, "workspace-trust dialog detected — sending Enter to dismiss");
                     session.send("", true) catch {};
                     shared.trust_dismissed = true;
+                    fired_this_iter = true;
                     // Reset the rolling buffer so the next dialog (bypass)
                     // is detected only after its own bytes arrive — without
                     // this, the trust dialog text lingers in the 8 KB window
@@ -513,15 +522,17 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     // fires — claude is about to repaint.
                     shared.last_output_ns.store(@intCast(std.time.nanoTimestamp()), .seq_cst);
                 }
-            } else if (!shared.bypass_perms_accepted) {
-                // 2. Bypass-permissions accept dialog: "WARNING: Claude Code
-                //    running in Bypass Permissions mode ... By proceeding,
-                //    you accept all responsibility ... 1. No, exit / 2. Yes,
-                //    I accept". Triggered by --dangerously-skip-permissions
-                //    when the user (or this session's persisted state) hasn't
-                //    accepted it before. Default selection = option 1 (No),
-                //    which exits claude — so we MUST type "2" to move to the
-                //    safe option, THEN Enter to confirm.
+            }
+
+            // 2. Bypass-permissions accept dialog: "WARNING: Claude Code
+            //    running in Bypass Permissions mode ... By proceeding,
+            //    you accept all responsibility ... 1. No, exit / 2. Yes,
+            //    I accept". Triggered by --dangerously-skip-permissions
+            //    when the user (or this session's persisted state) hasn't
+            //    accepted it before. Default selection = option 1 (No),
+            //    which exits claude — so we MUST type "2" to move to the
+            //    safe option, THEN Enter to confirm.
+            if (!shared.bypass_perms_accepted and !fired_this_iter) {
                 const has_bypass = std.mem.indexOf(u8, stripped, "Bypass") != null or
                     std.mem.indexOf(u8, stripped, "bypass") != null;
                 const has_permissions = std.mem.indexOf(u8, stripped, "Permissions") != null or
@@ -538,6 +549,7 @@ pub fn run(allocator: std.mem.Allocator, opts: Options) !Result {
                     std.Thread.sleep(ink_enter_debounce_ms * std.time.ns_per_ms);
                     session.send("", true) catch {};
                     shared.bypass_perms_accepted = true;
+                    fired_this_iter = true;
                     shared.recent_mutex.lock();
                     shared.recent.clearRetainingCapacity();
                     shared.recent_mutex.unlock();
